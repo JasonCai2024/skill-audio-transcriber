@@ -6,6 +6,7 @@ Audio Transcriber CLI Script
 Extracts full TXT text or SRT subtitles from local audio/video files.
 Outputs generated files in the same directory with the same basename.
 Uses ServiceHub ASR and ServiceHub OSS Proxy APIs (Zero client-side OSS credentials required).
+Supports automatic FFmpeg audio compression for large recording files to guarantee reliable uploads.
 """
 
 import os
@@ -14,10 +15,14 @@ import argparse
 import logging
 import subprocess
 import requests
+import urllib3
 from datetime import timedelta
 from pathlib import Path
 from typing import Dict, Any, List, Optional
 from dotenv import load_dotenv
+
+# Suppress insecure HTTPS request warnings
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # Configure Logging
 logging.basicConfig(
@@ -31,34 +36,71 @@ VIDEO_EXTENSIONS = {".mp4", ".mkv", ".avi", ".mov", ".flv", ".wmv", ".webm"}
 AUDIO_EXTENSIONS = {".mp3", ".wav", ".m4a", ".aac", ".flac", ".ogg", ".wma"}
 PROXY_ALLOWED_EXTENSIONS = {".mp3", ".wav", ".m4a"}
 
-DEFAULT_CONFIG_PATH = r"E:\BaiduSyncdisk\LocalHub\BiSubtitles\config.json"
+FALLBACK_CONFIG_PATHS = [
+    r"E:\BaiduSyncdisk\WorkSpace\config.json",
+    r"E:\BaiduSyncdisk\LocalHub\BiSubtitles\config.json",
+]
+
+
+def get_http_session() -> requests.Session:
+    """Create a configured requests session bypassing system proxies & SSL errors."""
+    session = requests.Session()
+    session.trust_env = False
+    return session
 
 
 def load_credentials() -> Dict[str, Any]:
     """
     Load credentials with priority:
     1. Environment variables / .env
-    2. Fallback local config file (config.json)
+    2. Fallback local config files (WorkSpace/config.json, BiSubtitles/config.json)
     """
     load_dotenv()
 
-    fallback_data = {}
-    if os.path.exists(DEFAULT_CONFIG_PATH):
-        try:
-            import json
-            with open(DEFAULT_CONFIG_PATH, "r", encoding="utf-8") as f:
-                fallback_data = json.load(f)
-        except Exception as e:
-            logger.warning(f"Could not load fallback config from {DEFAULT_CONFIG_PATH}: {e}")
+    username = os.getenv("SERVICEHUB_USERNAME")
+    passtoken = os.getenv("SERVICEHUB_PASSTOKEN")
+    api_base_url = os.getenv("SERVICEHUB_API_BASE_URL")
+    provider = os.getenv("ASR_PROVIDER")
+    model = os.getenv("ASR_MODEL")
 
-    llm_conf = fallback_data.get("llm", {})
-    asr_conf = fallback_data.get("asr", {})
+    for config_path in FALLBACK_CONFIG_PATHS:
+        if os.path.exists(config_path):
+            try:
+                import json
+                with open(config_path, "r", encoding="utf-8") as f:
+                    cfg = json.load(f)
 
-    username = os.getenv("SERVICEHUB_USERNAME") or llm_conf.get("username", "")
-    passtoken = os.getenv("SERVICEHUB_PASSTOKEN") or llm_conf.get("passtoken", "")
-    api_base_url = os.getenv("SERVICEHUB_API_BASE_URL") or asr_conf.get("api_base_url", "https://www.ccailab.top")
-    provider = os.getenv("ASR_PROVIDER") or asr_conf.get("provider", "aliyun")
-    model = os.getenv("ASR_MODEL") or asr_conf.get("model", "paraformer-v2")
+                # Check WorkSpace/config.json format
+                sh_node = cfg.get("servicehub", {}).get("wechat_proxy", {})
+                if not username and sh_node.get("username"):
+                    username = sh_node.get("username")
+                if not passtoken and sh_node.get("passtoken"):
+                    passtoken = sh_node.get("passtoken")
+                if not api_base_url and sh_node.get("remote_service_url"):
+                    api_base_url = sh_node.get("remote_service_url")
+
+                # Check BiSubtitles/config.json format
+                llm_node = cfg.get("llm", {})
+                asr_node = cfg.get("asr", {})
+                if not username and llm_node.get("username"):
+                    username = llm_node.get("username")
+                if not passtoken and llm_node.get("passtoken"):
+                    passtoken = llm_node.get("passtoken")
+                if not api_base_url and asr_node.get("api_base_url"):
+                    api_base_url = asr_node.get("api_base_url")
+                if not provider and asr_node.get("provider"):
+                    provider = asr_node.get("provider")
+                if not model and asr_node.get("model"):
+                    model = asr_node.get("model")
+
+            except Exception as e:
+                logger.warning(f"Could not load fallback config from {config_path}: {e}")
+
+    username = username or ""
+    passtoken = passtoken or ""
+    api_base_url = api_base_url or "https://www.ccailab.top"
+    provider = provider or "aliyun"
+    model = model or "paraformer-v2"
 
     return {
         "username": username,
@@ -69,9 +111,22 @@ def load_credentials() -> Dict[str, Any]:
     }
 
 
-def extract_audio_for_asr(input_media_path: Path) -> Path:
-    """Extract mono 16kHz WAV audio using ffmpeg."""
-    output_path = input_media_path.with_name(f"{input_media_path.stem}_asr_tmp.wav")
+def prepare_audio_for_asr(input_media_path: Path) -> Path:
+    """
+    Preprocess and compress audio using FFmpeg.
+    Converts video/unsupported audio/large audio (>20MB) to mono 16kHz 32kbps MP3
+    to drastically shrink file size and prevent upload timeouts.
+    """
+    file_size_mb = input_media_path.stat().st_size / (1024 * 1024)
+    ext = input_media_path.suffix.lower()
+
+    # If it's already a supported small audio (<20MB), use directly
+    if ext in PROXY_ALLOWED_EXTENSIONS and file_size_mb <= 20:
+        logger.info(f"Using original audio file directly ({file_size_mb:.2f} MB): {input_media_path.name}")
+        return input_media_path
+
+    # Otherwise, compress/convert via FFmpeg
+    output_path = input_media_path.with_name(f"{input_media_path.stem}_asr_tmp.mp3")
     cmd = [
         "ffmpeg",
         "-y",
@@ -82,21 +137,25 @@ def extract_audio_for_asr(input_media_path: Path) -> Path:
         "1",
         "-ar",
         "16000",
+        "-b:a",
+        "32k",
         str(output_path),
     ]
 
-    logger.info(f"Extracting audio via ffmpeg: {input_media_path.name} -> {output_path.name}")
+    logger.info(f"Compressing audio via FFmpeg ({file_size_mb:.2f} MB): {input_media_path.name} -> {output_path.name}")
     try:
         result = subprocess.run(cmd, check=False, capture_output=True, text=True)
     except FileNotFoundError:
         raise RuntimeError("FFmpeg non-existent on system PATH. Please install FFmpeg.")
 
     if result.returncode != 0:
-        raise RuntimeError(f"FFmpeg extraction failed: {result.stderr[:400]}")
+        raise RuntimeError(f"FFmpeg extraction/compression failed: {result.stderr[:400]}")
 
     if not output_path.exists():
-        raise RuntimeError("FFmpeg failed to produce output file.")
+        raise RuntimeError("FFmpeg failed to produce output compressed file.")
 
+    comp_size_mb = output_path.stat().st_size / (1024 * 1024)
+    logger.info(f"Audio compressed successfully: {comp_size_mb:.2f} MB")
     return output_path
 
 
@@ -108,13 +167,15 @@ def upload_to_oss_proxy(local_file: Path, creds: Dict[str, Any]) -> str:
     url = f"{base_url}/api/oss/upload-audio"
 
     logger.info(f"Uploading file via ServiceHub OSS Proxy: {local_file.name}")
+    session = get_http_session()
+
     with open(local_file, "rb") as f:
         files = {"audio_file": (local_file.name, f)}
         data = {
             "username": creds["username"],
             "passtoken": creds["passtoken"],
         }
-        response = requests.post(url, data=data, files=files, timeout=600)
+        response = session.post(url, data=data, files=files, verify=False, timeout=600)
 
     response.raise_for_status()
     result = response.json()
@@ -143,7 +204,8 @@ def delete_from_oss_proxy(oss_url: str, creds: Dict[str, Any]) -> bool:
             "oss_url": oss_url,
         }
         logger.info("Cleaning up temporary audio via ServiceHub OSS Proxy...")
-        response = requests.post(url, json=payload, timeout=30)
+        session = get_http_session()
+        response = session.post(url, json=payload, verify=False, timeout=30)
         response.raise_for_status()
         result = response.json()
         return bool(result.get("success"))
@@ -171,7 +233,8 @@ def call_asr_api(media_url: str, creds: Dict[str, Any]) -> Dict[str, Any]:
     headers = {"Content-Type": "application/json"}
 
     logger.info("Submitting ASR transcription request...")
-    response = requests.post(url, json=payload, headers=headers, timeout=600)
+    session = get_http_session()
+    response = session.post(url, json=payload, headers=headers, verify=False, timeout=900)
     response.raise_for_status()
 
     result = response.json()
@@ -268,9 +331,10 @@ def main():
     oss_url: Optional[str] = None
 
     try:
-        # Determine if extraction to supported audio format (.wav) is required
-        if ext in VIDEO_EXTENSIONS or ext not in PROXY_ALLOWED_EXTENSIONS:
-            temp_audio_path = extract_audio_for_asr(input_file)
+        # Preprocess / Compress audio to ensure file size <= 25MB
+        processed_path = prepare_audio_for_asr(input_file)
+        if processed_path != input_file:
+            temp_audio_path = processed_path
             upload_file_path = temp_audio_path
 
         # Upload via ServiceHub OSS Proxy API
