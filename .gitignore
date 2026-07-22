@@ -1,0 +1,25 @@
+# 环境变量与凭证物理隔离
+.env
+.env.local
+*.pem
+credentials.json
+
+# Python runtime
+__pycache__/
+*.py[cod]
+*$py.class
+venv/
+.venv/
+
+# 临时测试媒体与字幕文件
+*.wav
+*.mp3
+*.mp4
+*.srt
+*.txt
+!requirements.txt
+
+# IDE / System
+.vscode/
+.idea/
+.DS_Store
