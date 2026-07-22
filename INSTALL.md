@@ -21,17 +21,16 @@
    pip install -r scripts/requirements.txt
    ```
 
-2. 凭证配置（推荐）：
+2. 凭证配置：
    复制 `.env.example` 模板并重命名为 `.env`：
    ```bash
    cp .env.example .env
    ```
-   编辑 `.env` 文件，填写 ServiceHub 用户凭证与阿里云 OSS AccessKey。
+   编辑 `.env` 文件，填写 ServiceHub 的 `SERVICEHUB_USERNAME` 与 `SERVICEHUB_PASSTOKEN`。
 
 ---
 
 ## 3. 常见问题排查
 
 - **提示 `FFmpeg non-existent on system PATH`**：说明系统缺少 `ffmpeg` 命令，请检查环境变量配置。
-- **提示 `ASR API Error`**：请检查用户名与密码令牌是否正确，或账号积分是否足够。
-- **提示 `OSS credentials missing`**：请检查 `.env` 文件或配置中的 AccessKeyID 和 AccessKeySecret 是否有效。
+- **提示 `ServiceHub OSS upload failed` 或 `ASR API Error`**：请检查 ServiceHub 用户名与密码令牌是否正确。

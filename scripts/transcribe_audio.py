@@ -5,6 +5,7 @@
 Audio Transcriber CLI Script
 Extracts full TXT text or SRT subtitles from local audio/video files.
 Outputs generated files in the same directory with the same basename.
+Uses ServiceHub ASR and ServiceHub OSS Proxy APIs (Zero client-side OSS credentials required).
 """
 
 import os
@@ -13,10 +14,9 @@ import argparse
 import logging
 import subprocess
 import requests
-from datetime import datetime, timedelta
+from datetime import timedelta
 from pathlib import Path
 from typing import Dict, Any, List, Optional
-import oss2
 from dotenv import load_dotenv
 
 # Configure Logging
@@ -29,6 +29,7 @@ logger = logging.getLogger("audio_transcriber")
 
 VIDEO_EXTENSIONS = {".mp4", ".mkv", ".avi", ".mov", ".flv", ".wmv", ".webm"}
 AUDIO_EXTENSIONS = {".mp3", ".wav", ".m4a", ".aac", ".flac", ".ogg", ".wma"}
+PROXY_ALLOWED_EXTENSIONS = {".mp3", ".wav", ".m4a"}
 
 DEFAULT_CONFIG_PATH = r"E:\BaiduSyncdisk\LocalHub\BiSubtitles\config.json"
 
@@ -39,10 +40,8 @@ def load_credentials() -> Dict[str, Any]:
     1. Environment variables / .env
     2. Fallback local config file (config.json)
     """
-    # Load .env if present
     load_dotenv()
 
-    # Try fallback config.json
     fallback_data = {}
     if os.path.exists(DEFAULT_CONFIG_PATH):
         try:
@@ -54,7 +53,6 @@ def load_credentials() -> Dict[str, Any]:
 
     llm_conf = fallback_data.get("llm", {})
     asr_conf = fallback_data.get("asr", {})
-    oss_conf = fallback_data.get("oss", {})
 
     username = os.getenv("SERVICEHUB_USERNAME") or llm_conf.get("username", "")
     passtoken = os.getenv("SERVICEHUB_PASSTOKEN") or llm_conf.get("passtoken", "")
@@ -62,21 +60,12 @@ def load_credentials() -> Dict[str, Any]:
     provider = os.getenv("ASR_PROVIDER") or asr_conf.get("provider", "aliyun")
     model = os.getenv("ASR_MODEL") or asr_conf.get("model", "paraformer-v2")
 
-    bucket_name = os.getenv("OSS_BUCKET_NAME") or oss_conf.get("bucket_name", "temp-video-sub")
-    access_key_id = os.getenv("OSS_ACCESS_KEY_ID") or oss_conf.get("access_key_id", "")
-    access_key_secret = os.getenv("OSS_ACCESS_KEY_SECRET") or oss_conf.get("access_key_secret", "")
-    region = os.getenv("OSS_REGION") or oss_conf.get("region", "oss-cn-chengdu")
-
     return {
         "username": username,
         "passtoken": passtoken,
         "api_base_url": api_base_url,
         "provider": provider,
         "model": model,
-        "bucket_name": bucket_name,
-        "access_key_id": access_key_id,
-        "access_key_secret": access_key_secret,
-        "region": region,
     }
 
 
@@ -111,35 +100,55 @@ def extract_audio_for_asr(input_media_path: Path) -> Path:
     return output_path
 
 
-def upload_to_oss(local_file: Path, creds: Dict[str, Any]) -> str:
-    """Upload local audio file to Aliyun OSS and return temporary URL."""
-    auth = oss2.Auth(creds["access_key_id"], creds["access_key_secret"])
-    endpoint = f"https://{creds['region']}.aliyuncs.com"
-    bucket = oss2.Bucket(auth, endpoint, creds["bucket_name"])
+def upload_to_oss_proxy(local_file: Path, creds: Dict[str, Any]) -> str:
+    """Upload audio file via ServiceHub OSS proxy endpoint."""
+    base_url = creds["api_base_url"]
+    if not base_url.startswith("http"):
+        base_url = f"https://{base_url}"
+    url = f"{base_url}/api/oss/upload-audio"
 
-    timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
-    object_name = f"{timestamp}_{local_file.name}"
+    logger.info(f"Uploading file via ServiceHub OSS Proxy: {local_file.name}")
+    with open(local_file, "rb") as f:
+        files = {"audio_file": (local_file.name, f)}
+        data = {
+            "username": creds["username"],
+            "passtoken": creds["passtoken"],
+        }
+        response = requests.post(url, data=data, files=files, timeout=600)
 
-    logger.info(f"Uploading file to OSS: {local_file.name} as {object_name}")
-    bucket.put_object_from_file(object_name, str(local_file))
+    response.raise_for_status()
+    result = response.json()
+    if not result.get("success"):
+        error_msg = result.get("message", "Unknown error")
+        raise Exception(f"ServiceHub OSS upload failed: {error_msg}")
 
-    url = f"https://{creds['bucket_name']}.{creds['region']}.aliyuncs.com/{object_name}"
-    return url
+    oss_url = result.get("data", {}).get("oss_url")
+    if not oss_url:
+        raise Exception("ServiceHub OSS proxy response missing oss_url")
+
+    return oss_url
 
 
-def delete_from_oss(object_url: str, creds: Dict[str, Any]) -> bool:
-    """Delete uploaded file from OSS."""
+def delete_from_oss_proxy(oss_url: str, creds: Dict[str, Any]) -> bool:
+    """Delete audio file via ServiceHub OSS proxy endpoint."""
     try:
-        object_name = object_url.split("/")[-1]
-        auth = oss2.Auth(creds["access_key_id"], creds["access_key_secret"])
-        endpoint = f"https://{creds['region']}.aliyuncs.com"
-        bucket = oss2.Bucket(auth, endpoint, creds["bucket_name"])
+        base_url = creds["api_base_url"]
+        if not base_url.startswith("http"):
+            base_url = f"https://{base_url}"
+        url = f"{base_url}/api/oss/delete-audio"
 
-        logger.info(f"Cleaning up OSS object: {object_name}")
-        bucket.delete_object(object_name)
-        return True
+        payload = {
+            "username": creds["username"],
+            "passtoken": creds["passtoken"],
+            "oss_url": oss_url,
+        }
+        logger.info("Cleaning up temporary audio via ServiceHub OSS Proxy...")
+        response = requests.post(url, json=payload, timeout=30)
+        response.raise_for_status()
+        result = response.json()
+        return bool(result.get("success"))
     except Exception as e:
-        logger.warning(f"Failed to delete OSS object {object_url}: {e}")
+        logger.warning(f"Failed to delete audio via OSS Proxy {oss_url}: {e}")
         return False
 
 
@@ -188,7 +197,6 @@ def generate_srt(segments: List[Dict[str, Any]], srt_path: Path) -> None:
         logger.warning("No transcript segments found for SRT generation.")
         return
 
-    # Check time unit (seconds vs milliseconds)
     max_time = 0
     for seg in segments:
         b = seg.get("begin_time") or seg.get("start_time", 0)
@@ -254,22 +262,19 @@ def main():
     if not creds["username"] or not creds["passtoken"]:
         logger.error("Credentials missing: ServiceHub username and passtoken must be configured.")
         sys.exit(1)
-    if not creds["access_key_id"] or not creds["access_key_secret"]:
-        logger.error("OSS credentials missing: AccessKeyID and AccessKeySecret must be configured.")
-        sys.exit(1)
 
     temp_audio_path: Optional[Path] = None
     upload_file_path: Path = input_file
     oss_url: Optional[str] = None
 
     try:
-        # Check if video extraction needed
-        if ext in VIDEO_EXTENSIONS:
+        # Determine if extraction to supported audio format (.wav) is required
+        if ext in VIDEO_EXTENSIONS or ext not in PROXY_ALLOWED_EXTENSIONS:
             temp_audio_path = extract_audio_for_asr(input_file)
             upload_file_path = temp_audio_path
 
-        # Upload to OSS
-        oss_url = upload_to_oss(upload_file_path, creds)
+        # Upload via ServiceHub OSS Proxy API
+        oss_url = upload_to_oss_proxy(upload_file_path, creds)
 
         # Call ASR API
         data = call_asr_api(oss_url, creds)
@@ -295,10 +300,10 @@ def main():
         sys.exit(1)
 
     finally:
-        # Cleanup OSS
+        # Cleanup OSS Proxy object
         if oss_url:
-            delete_from_oss(oss_url, creds)
-        # Cleanup temporary audio file
+            delete_from_oss_proxy(oss_url, creds)
+        # Cleanup temporary local audio file
         if temp_audio_path and temp_audio_path.exists():
             try:
                 os.remove(temp_audio_path)

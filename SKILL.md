@@ -1,6 +1,6 @@
 ---
 name: skill-audio-transcriber
-description: 当用户需要从本地音频或视频文件中提取完整转录文案(TXT)或时间戳字幕文件(SRT)时使用此技能。技能会将结果自动保存为与原音视频文件同名同路径的文件。
+description: 当用户需要从本地音频或视频文件中提取完整转录文案(TXT)或时间戳字幕文件(SRT)时使用此技能。技能会将结果自动保存为与原音视频文件同名同路径的文件。仅需ServiceHub账号凭证，无需配置任何阿里云OSS密钥。
 disable-model-invocation: true
 user-invocable: true
 argument-hint: [audio-or-video-file-path]
@@ -10,7 +10,7 @@ argument-hint: [audio-or-video-file-path]
 
 ## Goal
 
-接收本地音频或视频文件路径，基于 ServiceHub ASR 语音识别与阿里云 OSS 临时传输能力，将音视频内容自动转录为完整 txt 文本或带精确时间戳的 srt 字幕，并严格输出在与源音视频文件相同的目录下，保持同名。
+接收本地音频或视频文件路径，基于 ServiceHub ASR 语音识别与 ServiceHub OSS 代理传输能力，将音视频内容自动转录为完整 txt 文本或带精确时间戳的 srt 字幕，并严格输出在与源音视频文件相同的目录下，保持同名。客户端仅需要 ServiceHub 用户名和密码，无需配置阿里云 OSS 密钥。
 
 ## Required Inputs
 
@@ -23,26 +23,25 @@ argument-hint: [audio-or-video-file-path]
    - 验证输入路径是否存在。
    - 检查后缀是否为受支持的音视频格式。
 2. **环境与凭证准备**：
-   - 优先从环境变量 / `.env` 加载 `SERVICEHUB_USERNAME`、`SERVICEHUB_PASSTOKEN`、阿里云 OSS AccessKey 等凭证。
+   - 优先从环境变量 / `.env` 加载 `SERVICEHUB_USERNAME` 与 `SERVICEHUB_PASSTOKEN`。
    - 若未配置，自动读取 `E:\BaiduSyncdisk\LocalHub\BiSubtitles\config.json` 作为保底凭证。
 3. **音频预处理（如需要）**：
-   - 若输入为视频格式或非标准音频，调用 `ffmpeg` 提取单声道 16kHz WAV 临时文件。
-4. **云端传输与 ASR 转录**：
-   - 调用 `oss2` 将音频上传至 OSS 临时 bucket。
-   - 请求 ServiceHub ASR 接口 (`https://www.ccailab.top/api/asr/paid-rotation`) 获取句级时间戳及转录全文。
-   - 在 `finally` 清理逻辑中，立即删除 OSS 上的临时音频文件及本地临时 WAV 提取文件。
+   - 若输入为视频格式或非 ServiceHub 代理支持的格式，调用 `ffmpeg` 提取单声道 16kHz WAV 临时文件。
+4. **云端代理传输与 ASR 转录**：
+   - 请求 ServiceHub OSS 代理接口 (`POST /api/oss/upload-audio`) 上传临时音频。
+   - 请求 ServiceHub ASR 接口 (`POST /api/asr/paid-rotation`) 获取句级时间戳及转录全文。
+   - 在 `finally` 清理逻辑中，请求 ServiceHub 代理接口 (`POST /api/oss/delete-audio`) 销毁云端临时音频，同时清理本地临时 WAV 文件。
 5. **写出目标文件**：
    - 在源文件所在同级目录下，生成同名的 `.txt` / `.srt` 文件。
 
 ## Decision Rules
 
 - **格式判断规则**：
-  - 若输入文件扩展名为 `.mp4`, `.mkv`, `.avi`, `.mov`, `.flv`, `.wmv`, `.webm` 中的任意一种，必须先经过 FFmpeg 提取音频。
-  - 若扩展名已为 `.wav`, `.mp3` 等格式，优先直接上传处理。
-- **凭证降级规则**：
-  - `.env` 环境变量 > `config.json` 配置文件。
+  - 若输入文件扩展名为视频格式或不在 `{".mp3", ".wav", ".m4a"}` 中，必须先经过 FFmpeg 提取/转码为 WAV 音频。
+- **凭证依赖规则**：
+  - 仅依赖 ServiceHub 账号机制 (`username` / `passtoken`)。屏蔽所有客户端阿里云 OSS AccessKey 等凭证需求。
 - **云端资源清理规则**：
-  - 无论 ASR 调用成功或失败，必须确保触发 OSS 临时文件删除逻辑。
+  - 无论 ASR 调用成功或失败，必须通过 ServiceHub 删除代理接口触发 OSS 临时文件删除逻辑。
 
 ## Output Requirements
 
@@ -55,13 +54,12 @@ argument-hint: [audio-or-video-file-path]
 
 1. **文件存在校验**：转录完成后，检查同目录下是否生成了对应的 `.txt` 或 `.srt` 文件。
 2. **非空校验**：生成的 `.txt` 或 `.srt` 文件大小必须大于 0 字节。
-3. **清理校验**：确认 OSS 上的临时对象与本地临时 WAV 文件均已成功删除。
+3. **清理校验**：确认 OSS 代理与本地临时文件均已被销毁。
 
 ## Fallback
 
 - 若缺乏 `ffmpeg` 运行环境：提示用户安装 FFmpeg 并加入系统环境变量 PATH。
-- 若 ASR API 返回积分不足或鉴权失败：输出明确的错误提示，终止后续写盘操作。
-- 若 OSS 上传失败：提示检查 `OSS_ACCESS_KEY_ID` 与 `OSS_ACCESS_KEY_SECRET`。
+- 若 ServiceHub ASR API 返回鉴权失败：提示用户检查 `SERVICEHUB_USERNAME` 和 `SERVICEHUB_PASSTOKEN`。
 
 ## Examples
 
